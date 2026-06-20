@@ -43,7 +43,12 @@ app.post('/api/restaurants/connexion', async (req, res) => {
   const token = jwt.sign({ id: data.id, nom: data.nom }, process.env.JWT_SECRET, { expiresIn: '7d' });
   res.json({ token, restaurant: data });
 });
-
+// ── LISTE DES RESTAURANTS (pour les clients) ──
+app.get('/api/restaurants', async (req, res) => {
+  const { data, error } = await supabase.from('restaurants').select('id, nom, ville').order('nom');
+  if (error) return res.status(400).json({ error: error.message });
+  res.json(data);
+});
 // ── MENU ──
 app.get('/api/menu/:restaurant_id', async (req, res) => {
   const { data, error } = await supabase.from('menus').select('*').eq('restaurant_id', req.params.restaurant_id);
