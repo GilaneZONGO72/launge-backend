@@ -40,15 +40,58 @@ app.post('/api/restaurants/connexion', async (req, res) => {
   if (error || !data) return res.status(400).json({ error: 'Email introuvable' });
   const valide = await bcrypt.compare(mot_de_passe, data.mot_de_passe);
   if (!valide) return res.status(400).json({ error: 'Mot de passe incorrect' });
+  if (data.statut === 'en_attente') return res.status(403).json({ error: 'Votre compte est en attente de validation par l\'administrateur.' });
+  if (data.statut === 'refuse') return res.status(403).json({ error: 'Votre inscription a été refusée.' });
   const token = jwt.sign({ id: data.id, nom: data.nom }, process.env.JWT_SECRET, { expiresIn: '7d' });
   res.json({ token, restaurant: data });
 });
+
 // ── LISTE DES RESTAURANTS (pour les clients) ──
 app.get('/api/restaurants', async (req, res) => {
-  const { data, error } = await supabase.from('restaurants').select('id, nom, ville').order('nom');
+  const { data, error } = await supabase.from('restaurants').select('id, nom, ville').eq('statut', 'valide').order('nom');
   if (error) return res.status(400).json({ error: error.message });
   res.json(data);
 });
+
+// ── CONNEXION ADMIN ──
+app.post('/api/admin/connexion', async (req, res) => {
+  const { email, mot_de_passe } = req.body;
+  const { data, error } = await supabase.from('admins').select('*').eq('email', email).single();
+  if (error || !data) return res.status(400).json({ error: 'Email introuvable' });
+  const valide = await bcrypt.compare(mot_de_passe, data.mot_de_passe);
+  if (!valide) return res.status(400).json({ error: 'Mot de passe incorrect' });
+  const token = jwt.sign({ id: data.id, role: 'admin' }, process.env.JWT_SECRET, { expiresIn: '7d' });
+  res.json({ token });
+});
+
+// ── LISTE RESTAURANTS POUR ADMIN (tous statuts) ──
+app.get('/api/admin/restaurants', async (req, res) => {
+  const { data, error } = await supabase.from('restaurants').select('id, nom, ville, telephone, email, statut, created_at').order('created_at', { ascending: false });
+  if (error) return res.status(400).json({ error: error.message });
+  res.json(data);
+});
+
+// ── VALIDER UN RESTAURANT ──
+app.put('/api/admin/restaurants/:id/valider', async (req, res) => {
+  const { data, error } = await supabase.from('restaurants').update({ statut: 'valide' }).eq('id', req.params.id).select();
+  if (error) return res.status(400).json({ error: error.message });
+  res.json(data[0]);
+});
+
+// ── REFUSER UN RESTAURANT ──
+app.put('/api/admin/restaurants/:id/refuser', async (req, res) => {
+  const { data, error } = await supabase.from('restaurants').update({ statut: 'refuse' }).eq('id', req.params.id).select();
+  if (error) return res.status(400).json({ error: error.message });
+  res.json(data[0]);
+});
+
+// ── SUPPRIMER UN RESTAURANT ──
+app.delete('/api/admin/restaurants/:id', async (req, res) => {
+  const { error } = await supabase.from('restaurants').delete().eq('id', req.params.id);
+  if (error) return res.status(400).json({ error: error.message });
+  res.json({ message: 'Restaurant supprimé' });
+});
+
 // ── MENU ──
 app.get('/api/menu/:restaurant_id', async (req, res) => {
   const { data, error } = await supabase.from('menus').select('*').eq('restaurant_id', req.params.restaurant_id);
