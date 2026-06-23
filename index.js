@@ -53,6 +53,13 @@ app.get('/api/restaurants', async (req, res) => {
   res.json(data);
 });
 
+// ── RESTAURANT PAR CODE UNIQUE (pour QR codes) ──
+app.get('/api/restaurants/code/:code_unique', async (req, res) => {
+  const { data, error } = await supabase.from('restaurants').select('id, nom, code_unique').eq('code_unique', req.params.code_unique).single();
+  if (error || !data) return res.status(404).json({ error: 'Restaurant introuvable' });
+  res.json(data);
+});
+
 // ── CONNEXION ADMIN ──
 app.post('/api/admin/connexion', async (req, res) => {
   const { email, mot_de_passe } = req.body;
