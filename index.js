@@ -115,6 +115,21 @@ app.post('/api/menu', async (req, res) => {
   res.json(data[0]);
 });
 
+// ── MODIFIER UN PLAT ──
+app.put('/api/menu/:id', async (req, res) => {
+  const { nom, prix, categorie, emoji, stock, seuil_alerte } = req.body;
+  const { data, error } = await supabase.from('menus').update({ nom, prix: +prix, categorie, emoji, stock: +stock, seuil_alerte: +seuil_alerte }).eq('id', req.params.id).select();
+  if (error) return res.status(400).json({ error: error.message });
+  res.json(data[0]);
+});
+
+// ── SUPPRIMER UN PLAT ──
+app.delete('/api/menu/:id', async (req, res) => {
+  const { error } = await supabase.from('menus').delete().eq('id', req.params.id);
+  if (error) return res.status(400).json({ error: error.message });
+  res.json({ message: 'Plat supprimé' });
+});
+
 // ── COMMANDES ──
 app.post('/api/commandes', async (req, res) => {
   const { restaurant_id, numero_table, items, total, mode_paiement } = req.body;
@@ -127,6 +142,15 @@ app.post('/api/commandes', async (req, res) => {
 
 app.get('/api/commandes/:restaurant_id', async (req, res) => {
   const { data, error } = await supabase.from('commandes').select('*').eq('restaurant_id', req.params.restaurant_id).order('created_at', { ascending: false });
+  if (error) return res.status(400).json({ error: error.message });
+  res.json(data);
+});
+
+// ── STATS INVENTAIRE (30 derniers jours) ──
+app.get('/api/stats/:restaurant_id', async (req, res) => {
+  const depuis = new Date();
+  depuis.setDate(depuis.getDate() - 30);
+  const { data, error } = await supabase.from('commandes').select('*').eq('restaurant_id', req.params.restaurant_id).gte('created_at', depuis.toISOString()).order('created_at', { ascending: false });
   if (error) return res.status(400).json({ error: error.message });
   res.json(data);
 });
