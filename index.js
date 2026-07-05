@@ -54,7 +54,12 @@ app.get('/api/restaurants/code/:code_unique', async (req, res) => {
   if (error || !data) return res.status(404).json({ error: 'Restaurant introuvable' });
   res.json(data);
 });
-
+// ── RESTAURANT PAR ID (pour infos recrutement via liste) ──
+app.get('/api/restaurants/:id/info', async (req, res) => {
+  const { data, error } = await supabase.from('restaurants').select('id, nom, ville, recrutement').eq('id', req.params.id).single();
+  if (error || !data) return res.status(404).json({ error: 'Restaurant introuvable' });
+  res.json(data);
+});
 // ── RECRUTEMENT ──
 app.put('/api/restaurants/:id/recrutement', async (req, res) => {
   const { recrutement } = req.body;
