@@ -16,12 +16,10 @@ const supabase = createClient(
   process.env.SUPABASE_KEY
 );
 
-// ── TEST ──
 app.get('/', (req, res) => {
   res.json({ message: '🍽️ Launge Backend fonctionne !' });
 });
 
-// ── INSCRIPTION RESTAURANT ──
 app.post('/api/restaurants/inscription', async (req, res) => {
   const { nom, ville, telephone, email, mot_de_passe } = req.body;
   const code_unique = 'LNG-' + Math.random().toString(36).substr(2, 6).toUpperCase();
@@ -33,7 +31,6 @@ app.post('/api/restaurants/inscription', async (req, res) => {
   res.json({ message: 'Restaurant créé !', code_unique, restaurant: data[0] });
 });
 
-// ── CONNEXION RESTAURANT ──
 app.post('/api/restaurants/connexion', async (req, res) => {
   const { email, mot_de_passe } = req.body;
   const { data, error } = await supabase.from('restaurants').select('*').eq('email', email).single();
@@ -46,21 +43,26 @@ app.post('/api/restaurants/connexion', async (req, res) => {
   res.json({ token, restaurant: data });
 });
 
-// ── LISTE DES RESTAURANTS (pour les clients) ──
 app.get('/api/restaurants', async (req, res) => {
   const { data, error } = await supabase.from('restaurants').select('id, nom, ville').eq('statut', 'valide').order('nom');
   if (error) return res.status(400).json({ error: error.message });
   res.json(data);
 });
 
-// ── RESTAURANT PAR CODE UNIQUE (pour QR codes) ──
 app.get('/api/restaurants/code/:code_unique', async (req, res) => {
-  const { data, error } = await supabase.from('restaurants').select('id, nom, code_unique').eq('code_unique', req.params.code_unique).single();
+  const { data, error } = await supabase.from('restaurants').select('id, nom, code_unique, recrutement').eq('code_unique', req.params.code_unique).single();
   if (error || !data) return res.status(404).json({ error: 'Restaurant introuvable' });
   res.json(data);
 });
 
-// ── CONNEXION ADMIN ──
+// ── RECRUTEMENT ──
+app.put('/api/restaurants/:id/recrutement', async (req, res) => {
+  const { recrutement } = req.body;
+  const { data, error } = await supabase.from('restaurants').update({ recrutement }).eq('id', req.params.id).select();
+  if (error) return res.status(400).json({ error: error.message });
+  res.json(data[0]);
+});
+
 app.post('/api/admin/connexion', async (req, res) => {
   const { email, mot_de_passe } = req.body;
   const { data, error } = await supabase.from('admins').select('*').eq('email', email).single();
@@ -71,35 +73,30 @@ app.post('/api/admin/connexion', async (req, res) => {
   res.json({ token });
 });
 
-// ── LISTE RESTAURANTS POUR ADMIN (tous statuts) ──
 app.get('/api/admin/restaurants', async (req, res) => {
   const { data, error } = await supabase.from('restaurants').select('id, nom, ville, telephone, email, statut, created_at').order('created_at', { ascending: false });
   if (error) return res.status(400).json({ error: error.message });
   res.json(data);
 });
 
-// ── VALIDER UN RESTAURANT ──
 app.put('/api/admin/restaurants/:id/valider', async (req, res) => {
   const { data, error } = await supabase.from('restaurants').update({ statut: 'valide' }).eq('id', req.params.id).select();
   if (error) return res.status(400).json({ error: error.message });
   res.json(data[0]);
 });
 
-// ── REFUSER UN RESTAURANT ──
 app.put('/api/admin/restaurants/:id/refuser', async (req, res) => {
   const { data, error } = await supabase.from('restaurants').update({ statut: 'refuse' }).eq('id', req.params.id).select();
   if (error) return res.status(400).json({ error: error.message });
   res.json(data[0]);
 });
 
-// ── SUPPRIMER UN RESTAURANT ──
 app.delete('/api/admin/restaurants/:id', async (req, res) => {
   const { error } = await supabase.from('restaurants').delete().eq('id', req.params.id);
   if (error) return res.status(400).json({ error: error.message });
   res.json({ message: 'Restaurant supprimé' });
 });
 
-// ── MENU ──
 app.get('/api/menu/:restaurant_id', async (req, res) => {
   const { data, error } = await supabase.from('menus').select('*').eq('restaurant_id', req.params.restaurant_id);
   if (error) return res.status(400).json({ error: error.message });
@@ -115,7 +112,6 @@ app.post('/api/menu', async (req, res) => {
   res.json(data[0]);
 });
 
-// ── MODIFIER UN PLAT ──
 app.put('/api/menu/:id', async (req, res) => {
   const { nom, prix, categorie, emoji, stock, seuil_alerte } = req.body;
   const { data, error } = await supabase.from('menus').update({ nom, prix: +prix, categorie, emoji, stock: +stock, seuil_alerte: +seuil_alerte }).eq('id', req.params.id).select();
@@ -123,14 +119,12 @@ app.put('/api/menu/:id', async (req, res) => {
   res.json(data[0]);
 });
 
-// ── SUPPRIMER UN PLAT ──
 app.delete('/api/menu/:id', async (req, res) => {
   const { error } = await supabase.from('menus').delete().eq('id', req.params.id);
   if (error) return res.status(400).json({ error: error.message });
   res.json({ message: 'Plat supprimé' });
 });
 
-// ── COMMANDES ──
 app.post('/api/commandes', async (req, res) => {
   const { restaurant_id, numero_table, items, total, mode_paiement } = req.body;
   const { data, error } = await supabase.from('commandes').insert([
@@ -146,7 +140,6 @@ app.get('/api/commandes/:restaurant_id', async (req, res) => {
   res.json(data);
 });
 
-// ── STATS INVENTAIRE (30 derniers jours) ──
 app.get('/api/stats/:restaurant_id', async (req, res) => {
   const depuis = new Date();
   depuis.setDate(depuis.getDate() - 30);
@@ -155,7 +148,6 @@ app.get('/api/stats/:restaurant_id', async (req, res) => {
   res.json(data);
 });
 
-// ── STOCK ──
 app.put('/api/stock/:menu_id', async (req, res) => {
   const { stock } = req.body;
   const { data, error } = await supabase.from('menus').update({ stock }).eq('id', req.params.menu_id).select();
