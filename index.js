@@ -96,8 +96,15 @@ app.put('/api/admin/restaurants/:id/refuser', async (req, res) => {
   res.json(data[0]);
 });
 
+// ── SUPPRIMER UN RESTAURANT ──
 app.delete('/api/admin/restaurants/:id', async (req, res) => {
-  const { error } = await supabase.from('restaurants').delete().eq('id', req.params.id);
+  const id = req.params.id;
+  // Supprimer d'abord les menus liés
+  await supabase.from('menus').delete().eq('restaurant_id', id);
+  // Supprimer ensuite les commandes liées
+  await supabase.from('commandes').delete().eq('restaurant_id', id);
+  // Puis supprimer le restaurant
+  const { error } = await supabase.from('restaurants').delete().eq('id', id);
   if (error) return res.status(400).json({ error: error.message });
   res.json({ message: 'Restaurant supprimé' });
 });
