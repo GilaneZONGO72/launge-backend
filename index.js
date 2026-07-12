@@ -43,6 +43,16 @@ app.post('/api/restaurants/connexion', async (req, res) => {
   res.json({ token, restaurant: data });
 });
 
+// ── CONNEXION CUISINE ──
+app.post('/api/restaurants/connexion-cuisine', async (req, res) => {
+  const { code_unique, code_cuisine } = req.body;
+  const { data, error } = await supabase.from('restaurants').select('id, nom, code_unique, code_cuisine').eq('code_unique', code_unique).single();
+  if (error || !data) return res.status(400).json({ error: 'Code restaurant introuvable' });
+  if (!data.code_cuisine) return res.status(400).json({ error: 'Aucun code cuisine défini pour ce restaurant' });
+  if (data.code_cuisine !== code_cuisine) return res.status(400).json({ error: 'Code cuisine incorrect' });
+  res.json({ restaurant: { id: data.id, nom: data.nom, code_unique: data.code_unique } });
+});
+
 app.get('/api/restaurants', async (req, res) => {
   const { data, error } = await supabase.from('restaurants').select('id, nom, ville').eq('statut', 'valide').order('nom');
   if (error) return res.status(400).json({ error: error.message });
@@ -54,16 +64,24 @@ app.get('/api/restaurants/code/:code_unique', async (req, res) => {
   if (error || !data) return res.status(404).json({ error: 'Restaurant introuvable' });
   res.json(data);
 });
-// ── RESTAURANT PAR ID (pour infos recrutement via liste) ──
+
 app.get('/api/restaurants/:id/info', async (req, res) => {
   const { data, error } = await supabase.from('restaurants').select('id, nom, ville, recrutement').eq('id', req.params.id).single();
   if (error || !data) return res.status(404).json({ error: 'Restaurant introuvable' });
   res.json(data);
 });
-// ── RECRUTEMENT ──
+
 app.put('/api/restaurants/:id/recrutement', async (req, res) => {
   const { recrutement } = req.body;
   const { data, error } = await supabase.from('restaurants').update({ recrutement }).eq('id', req.params.id).select();
+  if (error) return res.status(400).json({ error: error.message });
+  res.json(data[0]);
+});
+
+// ── MODIFIER CODE CUISINE ──
+app.put('/api/restaurants/:id/code-cuisine', async (req, res) => {
+  const { code_cuisine } = req.body;
+  const { data, error } = await supabase.from('restaurants').update({ code_cuisine }).eq('id', req.params.id).select();
   if (error) return res.status(400).json({ error: error.message });
   res.json(data[0]);
 });
@@ -96,14 +114,10 @@ app.put('/api/admin/restaurants/:id/refuser', async (req, res) => {
   res.json(data[0]);
 });
 
-// ── SUPPRIMER UN RESTAURANT ──
 app.delete('/api/admin/restaurants/:id', async (req, res) => {
   const id = req.params.id;
-  // Supprimer d'abord les menus liés
   await supabase.from('menus').delete().eq('restaurant_id', id);
-  // Supprimer ensuite les commandes liées
   await supabase.from('commandes').delete().eq('restaurant_id', id);
-  // Puis supprimer le restaurant
   const { error } = await supabase.from('restaurants').delete().eq('id', id);
   if (error) return res.status(400).json({ error: error.message });
   res.json({ message: 'Restaurant supprimé' });
