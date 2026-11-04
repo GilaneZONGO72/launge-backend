@@ -182,4 +182,6 @@ app.put('/api/stock/:menu_id', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Launge Backend sur http://localhost:${PORT}`));
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Launge Backend démarré sur le port ${PORT}`);
+});
