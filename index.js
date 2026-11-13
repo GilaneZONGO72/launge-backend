@@ -559,7 +559,34 @@ app.get('/api/commandes/:restaurant_id', validerUuid('restaurant_id'), exiger(['
   if (error) return echec(res, 'liste commandes', error);
   res.json(data);
 });
-
+// Suivi public d'une commande : la référence secrète (128 bits) fait office de clé, aucun compte nécessaire.
+// Ne renvoie que le strict nécessaire : jamais d'identifiant interne ni d'information sur d'autres commandes.
+app.get('/api/suivi/:reference',
+  limiter('suivi-ip', 1500, 600000, parIp),
+  limiter('suivi-ref', 400, 600000, (req) => String(req.params.reference).slice(0, 64)),
+  async (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    const ref = req.params.reference;
+    if (!/^[A-Za-z0-9_-]{16,64}$/.test(ref)) return res.status(404).json({ error: 'Commande introuvable.' });
+    const { data: cmd, error } = await supabase
+      .from('commandes')
+      .select('restaurant_id, numero_table, items, total, statut, mode_paiement, created_at')
+      .eq('reference_suivi', ref)
+      .maybeSingle();
+    if (error) return echec(res, 'suivi', error);
+    if (!cmd) return res.status(404).json({ error: 'Commande introuvable.' });
+    const { data: resto } = await supabase.from('restaurants').select('nom').eq('id', cmd.restaurant_id).maybeSingle();
+    res.json({
+      statut: cmd.statut,
+      numero_table: cmd.numero_table,
+      total: cmd.total,
+      mode_paiement: cmd.mode_paiement,
+      created_at: cmd.created_at,
+      items: (Array.isArray(cmd.items) ? cmd.items : []).map((i) => ({ nom: i.nom, qte: i.qte, prix: i.prix })),
+      restaurant: resto ? resto.nom : null,
+    });
+  }
+);
 // Nouvelle route : changement de statut vérifié par le serveur (en_cours → pret → servi).
 const TRANSITIONS = { en_cours: 'pret', pret: 'servi' };
 app.put('/api/commandes/:id/statut', validerUuid('id'), exiger(['restaurant', 'cuisine', 'admin'], { toujours: true }), async (req, res) => {
