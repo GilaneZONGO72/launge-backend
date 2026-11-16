@@ -293,15 +293,14 @@ app.post('/api/restaurants/connexion-cuisine', limiter('cuisine-ip', 200, 900000
 
 /* ───────────────────────── Restaurants : lecture publique ───────────────────────── */
 app.get('/api/restaurants', async (req, res) => {
-  const { data, error } = await supabase.from('restaurants').select('id, nom, ville, adresse, image_url').eq('statut', 'valide')
-  if (error) return echec(res, 'liste restaurants', error);
+  const { data, error } = await supabase.from('restaurants').select('id, nom, ville, adresse, image_url').eq('statut', 'valide').order('nom');
   res.json(data);
 });
 
 app.get('/api/restaurants/code/:code_unique', async (req, res) => {
   const code = texte(req.params.code_unique, 30);
   const { data, error } = await supabase.from('restaurants').select('id, nom, ville, adresse, image_url, recrutement, statut')
-  if (error) return echec(res, 'restaurant par code', error);
+  const { data, error } = await supabase.from('restaurants').select('id, nom, code_unique, recrutement, statut').eq('code_unique', code).maybeSingle();
   if (!data || STATUTS_BLOQUES.includes(data.statut)) return res.status(404).json({ error: 'Restaurant introuvable.' });
   const { statut, ...publicData } = data;
   res.json(publicData);
@@ -309,7 +308,7 @@ app.get('/api/restaurants/code/:code_unique', async (req, res) => {
 
 app.get('/api/restaurants/:id/info', validerUuid('id'), async (req, res) => {
   const { data, error } = await supabase.from('restaurants').select('id, nom, ville, recrutement, statut').eq('id', req.params.id).maybeSingle();
-  if (error) return echec(res, 'info restaurant', error);
+  const { data, error } = await supabase.from('restaurants').select('id, nom, ville, adresse, image_url, recrutement, statut').eq('id', req.params.id).maybeSingle();
   if (!data || STATUTS_BLOQUES.includes(data.statut)) return res.status(404).json({ error: 'Restaurant introuvable.' });
   const { statut, ...publicData } = data;
   res.json(publicData);
