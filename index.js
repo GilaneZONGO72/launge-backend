@@ -294,26 +294,26 @@ app.post('/api/restaurants/connexion-cuisine', limiter('cuisine-ip', 200, 900000
 /* ───────────────────────── Restaurants : lecture publique ───────────────────────── */
 app.get('/api/restaurants', async (req, res) => {
   const { data, error } = await supabase.from('restaurants').select('id, nom, ville, adresse, image_url').eq('statut', 'valide').order('nom');
+  if (error) return echec(res, 'liste restaurants', error);
   res.json(data);
 });
 
 app.get('/api/restaurants/code/:code_unique', async (req, res) => {
   const code = texte(req.params.code_unique, 30);
-  const { data, error } = await supabase.from('restaurants').select('id, nom, ville, adresse, image_url, recrutement, statut')
   const { data, error } = await supabase.from('restaurants').select('id, nom, code_unique, recrutement, statut').eq('code_unique', code).maybeSingle();
+  if (error) return echec(res, 'restaurant par code', error);
   if (!data || STATUTS_BLOQUES.includes(data.statut)) return res.status(404).json({ error: 'Restaurant introuvable.' });
   const { statut, ...publicData } = data;
   res.json(publicData);
 });
 
 app.get('/api/restaurants/:id/info', validerUuid('id'), async (req, res) => {
-  const { data, error } = await supabase.from('restaurants').select('id, nom, ville, recrutement, statut').eq('id', req.params.id).maybeSingle();
   const { data, error } = await supabase.from('restaurants').select('id, nom, ville, adresse, image_url, recrutement, statut').eq('id', req.params.id).maybeSingle();
+  if (error) return echec(res, 'info restaurant', error);
   if (!data || STATUTS_BLOQUES.includes(data.statut)) return res.status(404).json({ error: 'Restaurant introuvable.' });
   const { statut, ...publicData } = data;
   res.json(publicData);
 });
-
 /* ───────────────────────── Restaurants : réglages ───────────────────────── */
 // Profil public du restaurant (adresse et photo affichées dans la liste des restaurants).
 app.put('/api/restaurants/:id/profil', validerUuid('id'), exiger(['restaurant', 'admin']), async (req, res) => {
