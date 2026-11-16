@@ -293,14 +293,14 @@ app.post('/api/restaurants/connexion-cuisine', limiter('cuisine-ip', 200, 900000
 
 /* ───────────────────────── Restaurants : lecture publique ───────────────────────── */
 app.get('/api/restaurants', async (req, res) => {
-  const { data, error } = await supabase.from('restaurants').select('id, nom, ville').eq('statut', 'valide').order('nom');
+  const { data, error } = await supabase.from('restaurants').select('id, nom, ville, adresse, image_url').eq('statut', 'valide')
   if (error) return echec(res, 'liste restaurants', error);
   res.json(data);
 });
 
 app.get('/api/restaurants/code/:code_unique', async (req, res) => {
   const code = texte(req.params.code_unique, 30);
-  const { data, error } = await supabase.from('restaurants').select('id, nom, code_unique, recrutement, statut').eq('code_unique', code).maybeSingle();
+  const { data, error } = await supabase.from('restaurants').select('id, nom, ville, adresse, image_url, recrutement, statut')
   if (error) return echec(res, 'restaurant par code', error);
   if (!data || STATUTS_BLOQUES.includes(data.statut)) return res.status(404).json({ error: 'Restaurant introuvable.' });
   const { statut, ...publicData } = data;
@@ -316,6 +316,24 @@ app.get('/api/restaurants/:id/info', validerUuid('id'), async (req, res) => {
 });
 
 /* ───────────────────────── Restaurants : réglages ───────────────────────── */
+// Profil public du restaurant (adresse et photo affichées dans la liste des restaurants).
+app.put('/api/restaurants/:id/profil', validerUuid('id'), exiger(['restaurant', 'admin']), async (req, res) => {
+  if (!autorise(req, req.params.id)) return res.status(403).json({ error: 'Accès refusé.' });
+  const b = req.body || {};
+  const maj = {};
+  if (b.adresse !== undefined) maj.adresse = texte(b.adresse, 200) || null;
+  if (b.image_url !== undefined) {
+    if (b.image_url === null || b.image_url === '') maj.image_url = null;
+    // La photo doit venir de NOTRE stockage et du dossier de CE restaurant (pas de lien externe ni de photo d'un autre).
+    else if (typeof b.image_url === 'string' && b.image_url.length <= 500 && b.image_url.startsWith(`${PREFIXE_IMAGES}${req.params.id}/`)) maj.image_url = b.image_url;
+    else return res.status(400).json({ error: 'Image invalide.' });
+  }
+  if (!Object.keys(maj).length) return res.status(400).json({ error: 'Rien à modifier.' });
+  const { data, error } = await supabase.from('restaurants').update(maj).eq('id', req.params.id).select('id, nom, ville, adresse, image_url').maybeSingle();
+  if (error) return echec(res, 'profil restaurant', error);
+  if (!data) return res.status(404).json({ error: 'Restaurant introuvable.' });
+  res.json(data);
+});
 app.put('/api/restaurants/:id/recrutement', validerUuid('id'), exiger(['restaurant', 'admin']), async (req, res) => {
   if (!autorise(req, req.params.id)) return res.status(403).json({ error: 'Accès refusé.' });
   const recrutement = req.body && req.body.recrutement;
