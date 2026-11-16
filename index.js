@@ -588,7 +588,7 @@ app.get('/api/suivi/:reference',
   }
 );
 // Nouvelle route : changement de statut vérifié par le serveur (en_cours → pret → servi).
-const TRANSITIONS = { en_cours: 'pret', pret: 'servi' };
+const TRANSITIONS = { en_cours: ['acceptee', 'pret'], acceptee: ['pret'], pret: ['servi'] };
 app.put('/api/commandes/:id/statut', validerUuid('id'), exiger(['restaurant', 'cuisine', 'admin'], { toujours: true }), async (req, res) => {
   const nouveau = texte(req.body && req.body.statut, 20);
   const { data: cmd, error: e1 } = await supabase.from('commandes').select('id, restaurant_id, statut').eq('id', req.params.id).maybeSingle();
@@ -596,7 +596,7 @@ app.put('/api/commandes/:id/statut', validerUuid('id'), exiger(['restaurant', 'c
   if (!cmd) return res.status(404).json({ error: 'Commande introuvable.' });
   if (!autorise(req, cmd.restaurant_id)) return res.status(403).json({ error: 'Accès refusé.' });
   if (cmd.statut === nouveau) return res.json(cmd);
-  if (TRANSITIONS[cmd.statut] !== nouveau) return res.status(409).json({ error: 'Changement de statut impossible.' });
+  if (!Object.hasOwn(TRANSITIONS, cmd.statut) || !TRANSITIONS[cmd.statut].includes(nouveau)) return res.status(409).json({ error: 'Changement de statut impossible.' });
   const { data, error } = await supabase.from('commandes').update({ statut: nouveau }).eq('id', cmd.id).eq('statut', cmd.statut).select().maybeSingle();
   if (error) return echec(res, 'statut/maj', error);
   if (!data) return res.status(409).json({ error: 'La commande a déjà été modifiée.' });
