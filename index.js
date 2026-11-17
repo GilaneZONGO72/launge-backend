@@ -368,10 +368,18 @@ app.post('/api/admin/connexion', limiter('admin-ip', 100, 900000, parIp), limite
   res.json({ token });
 });
 
+// Journal des actions de l'administrateur (qui a fait quoi). Il ne bloque jamais l'action elle-même.
+async function journaliser(req, action, cible) {
+  try {
+    const { error } = await supabase.from('journal_admin').insert([{ admin_id: (req.auth && req.auth.id) || null, action, cible_id: cible.id, cible_nom: cible.nom || null }]);
+    if (error) console.error('[JOURNAL] écriture impossible :', error.message);
+  } catch (e) { console.error('[JOURNAL] écriture impossible :', e.message); }
+}
+
 app.get('/api/admin/restaurants', exiger(['admin']), async (req, res) => {
   const { data, error } = await supabase
     .from('restaurants')
-    .select('id, nom, ville, telephone, email, statut, created_at')
+    .select('id, nom, ville, adresse, image_url, code_unique, telephone, email, statut, created_at')
     .order('created_at', { ascending: false });
   if (error) return echec(res, 'admin liste', error);
   res.json(data);
@@ -382,18 +390,23 @@ for (const [action, statut] of [['valider', 'valide'], ['refuser', 'refuse']]) {
     const { data, error } = await supabase.from('restaurants').update({ statut }).eq('id', req.params.id).select().maybeSingle();
     if (error) return echec(res, `admin ${action}`, error);
     if (!data) return res.status(404).json({ error: 'Restaurant introuvable.' });
+    await journaliser(req, action, data);
     res.json(nettoyerResto(data));
   });
 }
 
 app.delete('/api/admin/restaurants/:id', validerUuid('id'), exiger(['admin']), async (req, res) => {
   const id = req.params.id;
+  const { data: resto, error: e0 } = await supabase.from('restaurants').select('id, nom').eq('id', id).maybeSingle();
+  if (e0) return echec(res, 'suppression lecture', e0);
+  if (!resto) return res.status(404).json({ error: 'Restaurant introuvable.' });
   const r1 = await supabase.from('menus').delete().eq('restaurant_id', id);
   if (r1.error) return echec(res, 'suppression menus', r1.error);
   const r2 = await supabase.from('commandes').delete().eq('restaurant_id', id);
   if (r2.error) return echec(res, 'suppression commandes', r2.error);
   const r3 = await supabase.from('restaurants').delete().eq('id', id);
   if (r3.error) return echec(res, 'suppression restaurant', r3.error);
+  await journaliser(req, 'supprimer', resto);
   try {
     const { data: fichiers } = await supabase.storage.from(BUCKET).list(id);
     if (fichiers && fichiers.length) await supabase.storage.from(BUCKET).remove(fichiers.map((f) => `${id}/${f.name}`));
@@ -401,6 +414,15 @@ app.delete('/api/admin/restaurants/:id', validerUuid('id'), exiger(['admin']), a
   res.json({ message: 'Restaurant supprimé' });
 });
 
+app.get('/api/admin/journal', exiger(['admin']), async (req, res) => {
+  const { data, error } = await supabase
+    .from('journal_admin')
+    .select('id, action, cible_id, cible_nom, created_at')
+    .order('created_at', { ascending: false })
+    .limit(60);
+  if (error) return echec(res, 'admin journal', error);
+  res.json(data);
+});
 /* ───────────────────────── Menu ───────────────────────── */
 function champsPlat(b, creation) {
   const maj = {};
