@@ -230,6 +230,7 @@ app.post('/api/restaurants/inscription', limiter('inscription', 10, 3600000, par
   const nom = texte(b.nom, 100);
   const ville = texte(b.ville, 100);
   const telephone = texte(b.telephone, 30);
+  const adresse = texte(b.adresse, 200) || null;
   const email = texte(b.email, 150).toLowerCase();
   const mdp = typeof b.mot_de_passe === 'string' ? b.mot_de_passe : '';
   if (!nom || !ville) return res.status(400).json({ error: 'Le nom et la ville sont obligatoires.' });
@@ -251,7 +252,7 @@ app.post('/api/restaurants/inscription', limiter('inscription', 10, 3600000, par
   const hash = await bcrypt.hash(mdp, 10);
   const { data, error } = await supabase
     .from('restaurants')
-    .insert([{ nom, ville, telephone, email, mot_de_passe: hash, code_unique }])
+    .insert([{ nom, ville, adresse, telephone, email, mot_de_passe: hash, code_unique }])
     .select()
     .single();
   if (error) return echec(res, 'inscription', error);
