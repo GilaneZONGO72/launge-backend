@@ -491,6 +491,7 @@ app.put('/api/menu/:id', validerUuid('id'), exiger(['restaurant', 'admin']), asy
   if (!plat) return;
   const { maj, erreurs } = champsPlat(req.body || {}, false);
   if (erreurs.length) return res.status(400).json({ error: `Champs invalides : ${erreurs.join(', ')}.` });
+  delete maj.stock; // le stock ne se modifie que par les routes de stock (sinon enregistrer le formulaire d'un plat écraserait les ventes en cours)
   if (!Object.keys(maj).length) return res.status(400).json({ error: 'Aucune modification.' });
   const { data, error } = await supabase.from('menus').update(maj).eq('id', plat.id).select().single();
   if (error) return echec(res, 'modification plat', error);
@@ -505,14 +506,94 @@ app.delete('/api/menu/:id', validerUuid('id'), exiger(['restaurant', 'admin']), 
   res.json({ message: 'Plat supprimé' });
 });
 
+// Traduit les erreurs « métier » renvoyées par la base en réponses claires.
+function erreurStock(res, ctx, err) {
+  const msg = (err && err.message) || '';
+  if (/PLAT_INTROUVABLE/.test(msg)) return res.status(404).json({ error: 'Plat introuvable.' });
+  if (/STOCK_INVALIDE|COMPTE_INVALIDE/.test(msg)) return res.status(400).json({ error: 'Quantité invalide.' });
+  if (/INVENTAIRE_VIDE/.test(msg)) return res.status(400).json({ error: "Renseignez au moins un plat pour l'inventaire." });
+  if (/INVENTAIRE_DOUBLON/.test(msg)) return res.status(400).json({ error: 'Un plat est compté deux fois.' });
+  return echec(res, ctx, err);
+}
+
+// Correction : on fixe une quantité exacte (l'écart est enregistré dans l'historique).
 app.put('/api/stock/:id', validerUuid('id'), exiger(['restaurant', 'admin']), async (req, res) => {
   const plat = await platAutorise(req, res);
   if (!plat) return;
   const stock = entier(req.body && req.body.stock, 0, 1000000);
   if (stock === null) return res.status(400).json({ error: 'Stock invalide.' });
-  const { data, error } = await supabase.from('menus').update({ stock }).eq('id', plat.id).select().single();
-  if (error) return echec(res, 'stock', error);
+  const { error } = await supabase.rpc('fixer_stock', { p_plat: plat.id, p_restaurant: plat.restaurant_id, p_stock: stock });
+  if (error) return erreurStock(res, 'stock', error);
+  const { data, error: e2 } = await supabase.from('menus').select('*').eq('id', plat.id).single();
+  if (e2) return echec(res, 'stock/lecture', e2);
   res.json(data);
+});
+
+// Réception de marchandise (+) ou retrait (-) : la variation est appliquée de façon atomique.
+app.post('/api/stock/:id/ajuster', validerUuid('id'), exiger(['restaurant', 'admin']), async (req, res) => {
+  const plat = await platAutorise(req, res);
+  if (!plat) return;
+  const delta = entier(req.body && req.body.delta, -1000000, 1000000);
+  if (delta === null || delta === 0) return res.status(400).json({ error: 'Quantité invalide.' });
+  const motif = delta > 0 ? 'reapprovisionnement' : 'correction';
+  const { error } = await supabase.rpc('ajuster_stock', { p_plat: plat.id, p_restaurant: plat.restaurant_id, p_delta: delta, p_motif: motif });
+  if (error) return erreurStock(res, 'stock/ajuster', error);
+  const { data, error: e2 } = await supabase.from('menus').select('*').eq('id', plat.id).single();
+  if (e2) return echec(res, 'stock/lecture', e2);
+  res.json(data);
+});
+
+// Historique des mouvements de stock (commandes, réceptions, corrections, inventaires).
+app.get('/api/stock/:restaurant_id/mouvements', validerUuid('restaurant_id'), exiger(['restaurant', 'admin']), async (req, res) => {
+  if (!autorise(req, req.params.restaurant_id)) return res.status(403).json({ error: 'Accès refusé.' });
+  const { data, error } = await supabase
+    .from('mouvements_stock')
+    .select('id, plat_id, plat_nom, delta, stock_apres, motif, created_at')
+    .eq('restaurant_id', req.params.restaurant_id)
+    .order('created_at', { ascending: false })
+    .limit(100);
+  if (error) return echec(res, 'mouvements', error);
+  res.json(data);
+});
+
+/* ───────────────────────── Inventaires ───────────────────────── */
+app.post('/api/inventaires/:restaurant_id', validerUuid('restaurant_id'), exiger(['restaurant', 'admin']), async (req, res) => {
+  if (!autorise(req, req.params.restaurant_id)) return res.status(403).json({ error: 'Accès refusé.' });
+  const brut = req.body && req.body.lignes;
+  if (!Array.isArray(brut) || brut.length < 1 || brut.length > 500) return res.status(400).json({ error: "Renseignez au moins un plat pour l'inventaire." });
+  const lignes = [];
+  for (const l of brut) {
+    const compte = entier(l && l.compte, 0, 1000000);
+    if (!l || !estUuid(l.plat_id) || compte === null) return res.status(400).json({ error: 'Quantité invalide.' });
+    lignes.push({ plat_id: l.plat_id, compte });
+  }
+  const { data: id, error } = await supabase.rpc('valider_inventaire', { p_restaurant: req.params.restaurant_id, p_lignes: lignes });
+  if (error) return erreurStock(res, 'inventaire', error);
+  const { data, error: e2 } = await supabase.from('inventaires').select('id, nb_plats, nb_ecarts, valeur_ecart, created_at').eq('id', id).single();
+  if (e2) return echec(res, 'inventaire/lecture', e2);
+  res.json(data);
+});
+
+app.get('/api/inventaires/:restaurant_id', validerUuid('restaurant_id'), exiger(['restaurant', 'admin']), async (req, res) => {
+  if (!autorise(req, req.params.restaurant_id)) return res.status(403).json({ error: 'Accès refusé.' });
+  const { data, error } = await supabase
+    .from('inventaires')
+    .select('id, nb_plats, nb_ecarts, valeur_ecart, created_at')
+    .eq('restaurant_id', req.params.restaurant_id)
+    .order('created_at', { ascending: false })
+    .limit(30);
+  if (error) return echec(res, 'liste inventaires', error);
+  res.json(data);
+});
+
+app.get('/api/inventaires/:restaurant_id/:id', validerUuid('restaurant_id'), validerUuid('id'), exiger(['restaurant', 'admin']), async (req, res) => {
+  if (!autorise(req, req.params.restaurant_id)) return res.status(403).json({ error: 'Accès refusé.' });
+  const { data: inv, error } = await supabase.from('inventaires').select('id, nb_plats, nb_ecarts, valeur_ecart, created_at').eq('id', req.params.id).eq('restaurant_id', req.params.restaurant_id).maybeSingle();
+  if (error) return echec(res, 'inventaire', error);
+  if (!inv) return res.status(404).json({ error: 'Inventaire introuvable.' });
+  const { data: lignes, error: e2 } = await supabase.from('inventaire_lignes').select('plat_id, plat_nom, prix, theorique, compte, ecart').eq('inventaire_id', inv.id).order('plat_nom');
+  if (e2) return echec(res, 'inventaire/lignes', e2);
+  res.json({ ...inv, lignes });
 });
 
 /* ───────────────────────── Photos des plats ───────────────────────── */
@@ -579,12 +660,31 @@ app.post('/api/commandes', limiter('commande', 300, 600000, parIp), async (req, 
     total += plat.prix * qte;
   }
 
+  // Décompte automatique du stock : tout ou rien, et jamais sous zéro (même si deux clients commandent en même temps).
+  const correlation = crypto.randomUUID();
+  const lignes = items.map((i) => ({ id: i.id, qte: i.qte }));
+  const { error: eStock } = await supabase.rpc('decompter_stock', { p_restaurant: b.restaurant_id, p_items: lignes, p_commande: correlation });
+  if (eStock) {
+    const m = /STOCK_INSUFFISANT:(.*)/.exec(eStock.message || '');
+    if (m) return res.status(400).json({ error: `Stock insuffisant pour ${m[1].trim()}.` });
+    if (/PLAT_INTROUVABLE/.test(eStock.message || '')) return res.status(400).json({ error: "Un des plats n'existe plus." });
+    return echec(res, 'commande/stock', eStock);
+  }
+
   const { data, error } = await supabase
     .from('commandes')
     .insert([{ restaurant_id: b.restaurant_id, numero_table: texte(b.numero_table, 20), items, total, mode_paiement: texte(b.mode_paiement, 30), statut: 'en_cours' }])
     .select()
     .single();
-  if (error) return echec(res, 'commande', error);
+  if (error) {
+    // La commande n'a pas pu être enregistrée : on remet les plats en stock.
+    const { error: eRestitution } = await supabase.rpc('restituer_stock', { p_restaurant: b.restaurant_id, p_items: lignes, p_commande: correlation });
+    if (eRestitution) console.error('[STOCK] restitution impossible :', eRestitution.message);
+    return echec(res, 'commande', error);
+  }
+  // On rattache les mouvements de stock à la commande créée (facultatif : l'historique reste correct sans).
+  const { error: eLien } = await supabase.from('mouvements_stock').update({ commande_id: data.id }).eq('commande_id', correlation);
+  if (eLien) console.error('[STOCK] lien commande impossible :', eLien.message);
   res.json(data);
 });
 
