@@ -623,8 +623,22 @@ app.post(
   }
 );
 
+// Outils des promotions : lecture du code, messages d'erreur clairs, numéro de téléphone.
+const CODE_PROMO = /^[A-Z0-9_-]{3,20}$/;
+const lireCode = (v) => (typeof v === 'string' ? v.trim().toUpperCase().slice(0, 30) : '');
+const chiffresTel = (v) => { const t = String(v == null ? '' : v).replace(/\D/g, ''); return t.length >= 8 && t.length <= 15 ? t : null; };
+function erreurPromo(res, ctx, err) {
+  const msg = (err && err.message) || '';
+  if (/PROMO_INVALIDE/.test(msg)) return res.status(400).json({ error: "Ce code promo n'est pas valable." });
+  if (/PROMO_EXPIREE/.test(msg)) return res.status(400).json({ error: 'Ce code promo a expiré.' });
+  if (/PROMO_EPUISEE/.test(msg)) return res.status(400).json({ error: "Ce code promo n'est plus disponible." });
+  const m = /PROMO_MINIMUM:(\d+)/.exec(msg);
+  if (m) return res.status(400).json({ error: `Ce code est valable à partir de ${Number(m[1]).toLocaleString('fr-FR')} FCFA de commande.` });
+  return echec(res, ctx, err);
+}
+
 /* ───────────────────────── Commandes ───────────────────────── */
-// Route publique : un client peut commander sans compte. Le total est recalculé ici.
+// Route publique : un client peut commander sans compte. Le total (et la remise) sont recalculés ici.
 app.post('/api/commandes', limiter('commande', 300, 600000, parIp), async (req, res) => {
   const b = req.body || {};
   if (!estUuid(b.restaurant_id)) return res.status(400).json({ error: 'Restaurant invalide.' });
@@ -660,6 +674,20 @@ app.post('/api/commandes', limiter('commande', 300, 600000, parIp), async (req, 
     total += plat.prix * qte;
   }
 
+  // Code promo : première lecture sans rien consommer, pour répondre clairement avant de toucher au stock.
+  const code = lireCode(b.code_promo);
+  let remise = 0;
+  if (code) {
+    if (!CODE_PROMO.test(code)) return res.status(400).json({ error: "Ce code promo n'est pas valable." });
+    const { data: ev, error: eP } = await supabase.rpc('evaluer_promo', { p_restaurant: b.restaurant_id, p_code: code, p_total: total, p_consommer: false });
+    if (eP) return erreurPromo(res, 'commande/promo', eP);
+    remise = ev.remise;
+  }
+
+  // Le numéro de téléphone n'est gardé que si le restaurant a activé la fidélité.
+  const { data: fid } = await supabase.from('fidelite_config').select('actif').eq('restaurant_id', b.restaurant_id).maybeSingle();
+  const telephone = fid && fid.actif ? chiffresTel(b.telephone) : null;
+
   // Décompte automatique du stock : tout ou rien, et jamais sous zéro (même si deux clients commandent en même temps).
   const correlation = crypto.randomUUID();
   const lignes = items.map((i) => ({ id: i.id, qte: i.qte }));
@@ -670,16 +698,28 @@ app.post('/api/commandes', limiter('commande', 300, 600000, parIp), async (req, 
     if (/PLAT_INTROUVABLE/.test(eStock.message || '')) return res.status(400).json({ error: "Un des plats n'existe plus." });
     return echec(res, 'commande/stock', eStock);
   }
+  const rendreStock = async () => {
+    const { error: eR } = await supabase.rpc('restituer_stock', { p_restaurant: b.restaurant_id, p_items: lignes, p_commande: correlation });
+    if (eR) console.error('[STOCK] restitution impossible :', eR.message);
+  };
+
+  // Seconde lecture, cette fois en comptant l'utilisation (verrou : une limite d'usage n'est jamais dépassée).
+  let promoId = null;
+  if (code) {
+    const { data: ev2, error: eP2 } = await supabase.rpc('evaluer_promo', { p_restaurant: b.restaurant_id, p_code: code, p_total: total, p_consommer: true });
+    if (eP2) { await rendreStock(); return erreurPromo(res, 'commande/promo2', eP2); }
+    promoId = ev2.id; remise = ev2.remise;
+  }
 
   const { data, error } = await supabase
     .from('commandes')
-    .insert([{ restaurant_id: b.restaurant_id, numero_table: texte(b.numero_table, 20), items, total, mode_paiement: texte(b.mode_paiement, 30), statut: 'en_cours' }])
+    .insert([{ restaurant_id: b.restaurant_id, numero_table: texte(b.numero_table, 20), items, total: total - remise, remise, code_promo: code || null, telephone, mode_paiement: texte(b.mode_paiement, 30), statut: 'en_cours' }])
     .select()
     .single();
   if (error) {
-    // La commande n'a pas pu être enregistrée : on remet les plats en stock.
-    const { error: eRestitution } = await supabase.rpc('restituer_stock', { p_restaurant: b.restaurant_id, p_items: lignes, p_commande: correlation });
-    if (eRestitution) console.error('[STOCK] restitution impossible :', eRestitution.message);
+    // La commande n'a pas pu être enregistrée : on remet les plats en stock et on rend le code promo.
+    await rendreStock();
+    if (promoId) { const { error: eRp } = await supabase.rpc('rendre_promo', { p_id: promoId }); if (eRp) console.error('[PROMO] restitution impossible :', eRp.message); }
     return echec(res, 'commande', error);
   }
   // On rattache les mouvements de stock à la commande créée (facultatif : l'historique reste correct sans).
@@ -687,7 +727,6 @@ app.post('/api/commandes', limiter('commande', 300, 600000, parIp), async (req, 
   if (eLien) console.error('[STOCK] lien commande impossible :', eLien.message);
   res.json(data);
 });
-
 app.get('/api/commandes/:restaurant_id', validerUuid('restaurant_id'), exiger(['restaurant', 'cuisine', 'admin']), async (req, res) => {
   if (!autorise(req, req.params.restaurant_id)) return res.status(403).json({ error: 'Accès refusé.' });
   const { data, error } = await supabase
@@ -701,32 +740,59 @@ app.get('/api/commandes/:restaurant_id', validerUuid('restaurant_id'), exiger(['
 });
 // Suivi public d'une commande : la référence secrète (128 bits) fait office de clé, aucun compte nécessaire.
 // Ne renvoie que le strict nécessaire : jamais d'identifiant interne ni d'information sur d'autres commandes.
+const REF_SUIVI = /^[A-Za-z0-9_-]{16,64}$/;
 app.get('/api/suivi/:reference',
   limiter('suivi-ip', 1500, 600000, parIp),
   limiter('suivi-ref', 400, 600000, (req) => String(req.params.reference).slice(0, 64)),
   async (req, res) => {
     res.set('Cache-Control', 'no-store');
     const ref = req.params.reference;
-    if (!/^[A-Za-z0-9_-]{16,64}$/.test(ref)) return res.status(404).json({ error: 'Commande introuvable.' });
+    if (!REF_SUIVI.test(ref)) return res.status(404).json({ error: 'Commande introuvable.' });
     const { data: cmd, error } = await supabase
       .from('commandes')
-      .select('restaurant_id, numero_table, items, total, statut, mode_paiement, created_at')
+      .select('id, restaurant_id, numero_table, items, total, statut, mode_paiement, created_at, remise, code_promo, telephone, recompense_code, fidelite_traitee')
       .eq('reference_suivi', ref)
       .maybeSingle();
     if (error) return echec(res, 'suivi', error);
     if (!cmd) return res.status(404).json({ error: 'Commande introuvable.' });
     const { data: resto } = await supabase.from('restaurants').select('nom').eq('id', cmd.restaurant_id).maybeSingle();
+    const { data: avis } = await supabase.from('avis').select('note, commentaire').eq('commande_id', cmd.id).maybeSingle();
     res.json({
       statut: cmd.statut,
       numero_table: cmd.numero_table,
       total: cmd.total,
+      remise: cmd.remise || 0,
+      code_promo: cmd.code_promo || null,
       mode_paiement: cmd.mode_paiement,
       created_at: cmd.created_at,
       items: (Array.isArray(cmd.items) ? cmd.items : []).map((i) => ({ nom: i.nom, qte: i.qte, prix: i.prix })),
       restaurant: resto ? resto.nom : null,
+      recompense_code: cmd.recompense_code || null,
+      fidelite_attente: Boolean(cmd.telephone) && !cmd.fidelite_traitee,
+      avis: avis || null,
     });
   }
 );
+
+// Avis du client : une seule fois par commande, uniquement une fois la commande servie.
+app.post('/api/suivi/:reference/avis', limiter('avis-ip', 30, 3600000, parIp), async (req, res) => {
+  const ref = req.params.reference;
+  if (!REF_SUIVI.test(ref)) return res.status(404).json({ error: 'Commande introuvable.' });
+  const note = entier(req.body && req.body.note, 1, 5);
+  if (note === null) return res.status(400).json({ error: 'Choisissez une note de 1 à 5.' });
+  const commentaire = texte(req.body && req.body.commentaire, 600) || null;
+  const { data: cmd, error: e1 } = await supabase.from('commandes').select('id, restaurant_id, statut').eq('reference_suivi', ref).maybeSingle();
+  if (e1) return echec(res, 'avis/commande', e1);
+  if (!cmd) return res.status(404).json({ error: 'Commande introuvable.' });
+  if (cmd.statut !== 'servi') return res.status(409).json({ error: 'Vous pourrez donner votre avis une fois la commande servie.' });
+  const { error } = await supabase.from('avis').insert([{ restaurant_id: cmd.restaurant_id, commande_id: cmd.id, note, commentaire }]);
+  if (error) {
+    if (error.code === '23505') return res.status(409).json({ error: 'Vous avez déjà donné votre avis sur cette commande.' });
+    return echec(res, 'avis/insert', error);
+  }
+  res.json({ note, commentaire });
+});
+
 // Nouvelle route : changement de statut vérifié par le serveur (en_cours → pret → servi).
 const TRANSITIONS = { en_cours: ['acceptee', 'pret'], acceptee: ['pret'], pret: ['servi'] };
 app.put('/api/commandes/:id/statut', validerUuid('id'), exiger(['restaurant', 'cuisine', 'admin'], { toujours: true }), async (req, res) => {
@@ -740,9 +806,154 @@ app.put('/api/commandes/:id/statut', validerUuid('id'), exiger(['restaurant', 'c
   const { data, error } = await supabase.from('commandes').update({ statut: nouveau }).eq('id', cmd.id).eq('statut', cmd.statut).select().maybeSingle();
   if (error) return echec(res, 'statut/maj', error);
   if (!data) return res.status(409).json({ error: 'La commande a déjà été modifiée.' });
+  // Fidélité : quand la commande est servie, on ajoute les points du client (s'il a donné son numéro).
+  if (nouveau === 'servi' && data.telephone && !data.fidelite_traitee) {
+    const { data: recompense, error: eF } = await supabase.rpc('crediter_fidelite', { p_restaurant: data.restaurant_id, p_tel: data.telephone, p_montant: data.total });
+    if (eF) console.error('[FIDELITE] crédit impossible :', eF.message);
+    else {
+      const { error: eM } = await supabase.from('commandes').update({ fidelite_traitee: true, recompense_code: recompense || null }).eq('id', data.id);
+      if (eM) console.error('[FIDELITE] marquage impossible :', eM.message);
+    }
+  }
   res.json(data);
 });
 
+/* ───────────────────────── Promotions, avis, fidélité ───────────────────────── */
+const COLONNES_PROMO = 'id, code, type, valeur, min_commande, debut, fin, max_usages, usages, actif, created_at';
+const dateDebut = (s) => (typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s) && !isNaN(new Date(`${s}T00:00:00+01:00`)) ? `${s}T00:00:00+01:00` : null);
+const dateFin = (s) => (typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s) && !isNaN(new Date(`${s}T23:59:59+01:00`)) ? `${s}T23:59:59+01:00` : null);
+
+// Le client vérifie son code avant de payer (aperçu : la commande recalcule tout de son côté).
+app.post('/api/promotions/verifier', limiter('promo-ip', 60, 600000, parIp), async (req, res) => {
+  const b = req.body || {};
+  const code = lireCode(b.code);
+  if (!estUuid(b.restaurant_id) || !CODE_PROMO.test(code)) return res.status(400).json({ error: "Ce code promo n'est pas valable." });
+  if (!Array.isArray(b.items) || b.items.length < 1 || b.items.length > 50) return res.status(400).json({ error: 'Panier invalide.' });
+  const quantites = new Map();
+  for (const it of b.items) {
+    const qte = entier(it && it.qte, 1, 99);
+    if (!it || !estUuid(it.id) || qte === null) return res.status(400).json({ error: 'Panier invalide.' });
+    quantites.set(it.id, (quantites.get(it.id) || 0) + qte);
+  }
+  const { data: plats, error: e1 } = await supabase.from('menus').select('id, prix').eq('restaurant_id', b.restaurant_id).in('id', [...quantites.keys()]);
+  if (e1) return echec(res, 'promo/menu', e1);
+  let total = 0;
+  for (const [id, qte] of quantites) {
+    const plat = (plats || []).find((p) => p.id === id);
+    if (!plat) return res.status(400).json({ error: "Un des plats n'existe plus." });
+    total += plat.prix * qte;
+  }
+  const { data, error } = await supabase.rpc('evaluer_promo', { p_restaurant: b.restaurant_id, p_code: code, p_total: total, p_consommer: false });
+  if (error) return erreurPromo(res, 'promo/verifier', error);
+  res.json({ code: data.code, remise: data.remise, total_apres: total - data.remise });
+});
+
+app.get('/api/promotions/:restaurant_id', validerUuid('restaurant_id'), exiger(['restaurant', 'admin']), async (req, res) => {
+  if (!autorise(req, req.params.restaurant_id)) return res.status(403).json({ error: 'Accès refusé.' });
+  const { data, error } = await supabase.from('promotions').select(COLONNES_PROMO).eq('restaurant_id', req.params.restaurant_id).eq('source', 'manuel').order('created_at', { ascending: false }).limit(200);
+  if (error) return echec(res, 'liste promos', error);
+  res.json(data);
+});
+
+app.post('/api/promotions/:restaurant_id', validerUuid('restaurant_id'), exiger(['restaurant', 'admin']), async (req, res) => {
+  if (!autorise(req, req.params.restaurant_id)) return res.status(403).json({ error: 'Accès refusé.' });
+  const b = req.body || {};
+  const code = lireCode(b.code);
+  if (!CODE_PROMO.test(code)) return res.status(400).json({ error: 'Le code doit contenir de 3 à 20 lettres, chiffres ou tirets.' });
+  const type = b.type === 'montant' ? 'montant' : b.type === 'pourcent' ? 'pourcent' : null;
+  if (!type) return res.status(400).json({ error: 'Choisissez le type de réduction.' });
+  const valeur = entier(b.valeur, 1, type === 'pourcent' ? 100 : 10000000);
+  if (valeur === null) return res.status(400).json({ error: type === 'pourcent' ? 'Le pourcentage doit être entre 1 et 100.' : 'Montant invalide.' });
+  const minCommande = b.min_commande === '' || b.min_commande == null ? 0 : entier(b.min_commande, 0, 10000000);
+  if (minCommande === null) return res.status(400).json({ error: 'Montant minimum invalide.' });
+  const maxUsages = b.max_usages === '' || b.max_usages == null ? null : entier(b.max_usages, 1, 1000000);
+  if (b.max_usages !== '' && b.max_usages != null && maxUsages === null) return res.status(400).json({ error: "Limite d'utilisations invalide." });
+  const debut = b.debut ? dateDebut(b.debut) : null;
+  const fin = b.fin ? dateFin(b.fin) : null;
+  if ((b.debut && !debut) || (b.fin && !fin)) return res.status(400).json({ error: 'Date invalide.' });
+  if (debut && fin && new Date(fin) < new Date(debut)) return res.status(400).json({ error: 'La date de fin précède la date de début.' });
+  const { data, error } = await supabase.from('promotions')
+    .insert([{ restaurant_id: req.params.restaurant_id, code, type, valeur, min_commande: minCommande, max_usages: maxUsages, debut, fin }])
+    .select(COLONNES_PROMO).single();
+  if (error) {
+    if (error.code === '23505') return res.status(409).json({ error: 'Ce code existe déjà.' });
+    return echec(res, 'créer promo', error);
+  }
+  res.json(data);
+});
+
+app.put('/api/promotions/:restaurant_id/:id', validerUuid('restaurant_id', 'id'), exiger(['restaurant', 'admin']), async (req, res) => {
+  if (!autorise(req, req.params.restaurant_id)) return res.status(403).json({ error: 'Accès refusé.' });
+  if (typeof (req.body && req.body.actif) !== 'boolean') return res.status(400).json({ error: 'Requête invalide.' });
+  const { data, error } = await supabase.from('promotions').update({ actif: req.body.actif })
+    .eq('id', req.params.id).eq('restaurant_id', req.params.restaurant_id).eq('source', 'manuel').select(COLONNES_PROMO).maybeSingle();
+  if (error) return echec(res, 'maj promo', error);
+  if (!data) return res.status(404).json({ error: 'Promotion introuvable.' });
+  res.json(data);
+});
+
+app.delete('/api/promotions/:restaurant_id/:id', validerUuid('restaurant_id', 'id'), exiger(['restaurant', 'admin']), async (req, res) => {
+  if (!autorise(req, req.params.restaurant_id)) return res.status(403).json({ error: 'Accès refusé.' });
+  const { error } = await supabase.from('promotions').delete().eq('id', req.params.id).eq('restaurant_id', req.params.restaurant_id).eq('source', 'manuel');
+  if (error) return echec(res, 'supprimer promo', error);
+  res.json({ ok: true });
+});
+
+// Vitrine publique : note moyenne et programme de fidélité (affichés au client).
+app.get('/api/restaurants/:id/vitrine', validerUuid('id'), async (req, res) => {
+  const { data: notes, error } = await supabase.from('avis').select('note').eq('restaurant_id', req.params.id).limit(5000);
+  if (error) return echec(res, 'vitrine/avis', error);
+  const { data: fid } = await supabase.from('fidelite_config').select('actif, fcfa_par_point, seuil_points, valeur_recompense').eq('restaurant_id', req.params.id).maybeSingle();
+  const nb = (notes || []).length;
+  const moyenne = nb ? Math.round(((notes || []).reduce((s, n) => s + n.note, 0) / nb) * 10) / 10 : null;
+  res.json({ note_moyenne: moyenne, nb_avis: nb, fidelite: fid && fid.actif ? fid : { actif: false } });
+});
+
+app.get('/api/restaurants/:id/avis', validerUuid('id'), async (req, res) => {
+  const { data, error } = await supabase.from('avis').select('note, commentaire, reponse, created_at').eq('restaurant_id', req.params.id).order('created_at', { ascending: false }).limit(30);
+  if (error) return echec(res, 'avis public', error);
+  res.json(data);
+});
+
+app.get('/api/avis/:restaurant_id', validerUuid('restaurant_id'), exiger(['restaurant', 'admin']), async (req, res) => {
+  if (!autorise(req, req.params.restaurant_id)) return res.status(403).json({ error: 'Accès refusé.' });
+  const { data, error } = await supabase.from('avis').select('id, note, commentaire, reponse, reponse_at, created_at').eq('restaurant_id', req.params.restaurant_id).order('created_at', { ascending: false }).limit(100);
+  if (error) return echec(res, 'liste avis', error);
+  res.json(data);
+});
+
+app.put('/api/avis/:restaurant_id/:id/reponse', validerUuid('restaurant_id', 'id'), exiger(['restaurant', 'admin']), async (req, res) => {
+  if (!autorise(req, req.params.restaurant_id)) return res.status(403).json({ error: 'Accès refusé.' });
+  const reponse = texte(req.body && req.body.reponse, 500);
+  if (!reponse) return res.status(400).json({ error: 'Écrivez votre réponse.' });
+  const { data, error } = await supabase.from('avis').update({ reponse, reponse_at: new Date().toISOString() })
+    .eq('id', req.params.id).eq('restaurant_id', req.params.restaurant_id).select('id, note, commentaire, reponse, reponse_at, created_at').maybeSingle();
+  if (error) return echec(res, 'réponse avis', error);
+  if (!data) return res.status(404).json({ error: 'Avis introuvable.' });
+  res.json(data);
+});
+
+app.get('/api/fidelite/:restaurant_id', validerUuid('restaurant_id'), exiger(['restaurant', 'admin']), async (req, res) => {
+  if (!autorise(req, req.params.restaurant_id)) return res.status(403).json({ error: 'Accès refusé.' });
+  const { data: cfg, error } = await supabase.from('fidelite_config').select('actif, fcfa_par_point, seuil_points, valeur_recompense').eq('restaurant_id', req.params.restaurant_id).maybeSingle();
+  if (error) return echec(res, 'fidélité', error);
+  const { count } = await supabase.from('fidelite').select('telephone', { count: 'exact', head: true }).eq('restaurant_id', req.params.restaurant_id);
+  res.json({ ...(cfg || { actif: false, fcfa_par_point: 1000, seuil_points: 10, valeur_recompense: 2000 }), nb_clients: count || 0 });
+});
+
+app.put('/api/fidelite/:restaurant_id', validerUuid('restaurant_id'), exiger(['restaurant', 'admin']), async (req, res) => {
+  if (!autorise(req, req.params.restaurant_id)) return res.status(403).json({ error: 'Accès refusé.' });
+  const b = req.body || {};
+  const fcfa = entier(b.fcfa_par_point, 100, 1000000);
+  const seuil = entier(b.seuil_points, 1, 10000);
+  const valeur = entier(b.valeur_recompense, 100, 10000000);
+  if (typeof b.actif !== 'boolean' || fcfa === null || seuil === null || valeur === null) return res.status(400).json({ error: 'Valeurs invalides.' });
+  const { data, error } = await supabase.from('fidelite_config')
+    .upsert([{ restaurant_id: req.params.restaurant_id, actif: b.actif, fcfa_par_point: fcfa, seuil_points: seuil, valeur_recompense: valeur }], { onConflict: 'restaurant_id' })
+    .select('actif, fcfa_par_point, seuil_points, valeur_recompense').single();
+  if (error) return echec(res, 'maj fidélité', error);
+  res.json(data);
+});
 app.get('/api/stats/:restaurant_id', validerUuid('restaurant_id'), exiger(['restaurant', 'admin']), async (req, res) => {
   if (!autorise(req, req.params.restaurant_id)) return res.status(403).json({ error: 'Accès refusé.' });
   const depuis = new Date();
