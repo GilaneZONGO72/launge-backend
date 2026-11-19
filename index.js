@@ -128,7 +128,53 @@ function ouvrirSession(res, payload) {
   return token;
 }
 
-function authentifier(req, res, next) {
+// Personnel : l'état du compte est relu en base (mémoire de 30 s) pour qu'un compte désactivé perde l'accès presque aussitôt.
+const cachePersonnel = new Map();
+async function lirePersonnel(id) {
+  const c = cachePersonnel.get(id);
+  if (c && c.jusqua > Date.now()) return c.valeur;
+  try {
+    const { data, error } = await supabase.from('personnel').select('id, actif, poste, restaurant_id').eq('id', id).maybeSingle();
+    if (error) return undefined; // base indisponible : on refuse, sans mémoriser
+    cachePersonnel.set(id, { valeur: data || null, jusqua: Date.now() + 30000 });
+    return data || null;
+  } catch { return undefined; }
+}
+const oublierPersonnel = (id) => cachePersonnel.delete(id);
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, e] of cachePersonnel) if (e.jusqua <= now) cachePersonnel.delete(k);
+}, 60000).unref();
+
+// Ce que chaque poste a le droit de toucher. Tout le reste (équipe, profil, code cuisine, recrutement, QR codes) reste réservé au gérant.
+const ACCES_POSTES = {
+  manager: ['menu', 'stock', 'commandes', 'clients', 'stats'],
+  caissier: ['commandes'],
+  cuisinier: ['commandes'],
+  stock: ['stock', 'menu'],
+};
+function domaineRoute(chemin) {
+  if (/^\/api\/menu(\/|$)/.test(chemin)) return 'menu';
+  if (/^\/api\/(stock|inventaires)(\/|$)/.test(chemin)) return 'stock';
+  if (/^\/api\/commandes(\/|$)/.test(chemin)) return 'commandes';
+  if (/^\/api\/(promotions|avis|fidelite)(\/|$)/.test(chemin)) return 'clients';
+  if (/^\/api\/stats(\/|$)/.test(chemin)) return 'stats';
+  return null;
+}
+function accesPersonnel(req) {
+  const poste = req.auth.poste;
+  const domaine = domaineRoute(req.path);
+  if (!domaine || !(ACCES_POSTES[poste] || []).includes(domaine)) return false;
+  // Le responsable de stock peut régler un seuil d'alerte, mais ne modifie ni les prix ni les plats.
+  if (poste === 'stock' && domaine === 'menu') {
+    if (req.method !== 'PUT') return false;
+    const cles = Object.keys(req.body || {});
+    return cles.length > 0 && cles.every((k) => k === 'seuil_alerte');
+  }
+  return true;
+}
+
+async function authentifier(req, res, next) {
   req.auth = null;
   req.viaCookie = false;
   req.jetonInvalide = false;
@@ -149,6 +195,16 @@ function authentifier(req, res, next) {
       req.viaCookie = false;
     }
   }
+  if (req.auth && req.auth.role === 'personnel') {
+    const p = await lirePersonnel(req.auth.id);
+    if (!p || !p.actif || p.restaurant_id !== req.auth.restaurant_id) {
+      req.auth = null;
+      req.jetonInvalide = true;
+      req.viaCookie = false;
+    } else {
+      req.auth = { ...req.auth, poste: p.poste };
+    }
+  }
   next();
 }
 
@@ -161,7 +217,10 @@ function exiger(roles, { toujours = false } = {}) {
       console.warn(`[TRANSITION] appel sans jeton : ${req.method} ${req.path}`);
       return next();
     }
-    if (!roles.includes(req.auth.role)) return res.status(403).json({ error: 'Accès refusé.' });
+    if (req.auth.role === 'personnel') {
+      // Un membre du personnel passe seulement là où son poste le permet (ou sur les routes ouvertes explicitement au personnel).
+      if (!roles.includes('personnel') && !(roles.includes('restaurant') && accesPersonnel(req))) return res.status(403).json({ error: 'Accès refusé.' });
+    } else if (!roles.includes(req.auth.role)) return res.status(403).json({ error: 'Accès refusé.' });
     // Protection CSRF : une action de modification par cookie doit venir d'un site autorisé.
     if (req.viaCookie && !['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
       const o = req.headers.origin;
@@ -170,7 +229,6 @@ function exiger(roles, { toujours = false } = {}) {
     next();
   };
 }
-
 // Le restaurant connecté a-t-il le droit de toucher à ce restaurant ?
 function autorise(req, restaurantId) {
   if (!req.auth) return !AUTH_STRICT; // transition uniquement
@@ -212,7 +270,7 @@ app.post('/api/auth/deconnexion', (req, res) => {
 });
 
 // Permet au site de retrouver la session après un rechargement de page.
-app.get('/api/auth/moi', exiger(['restaurant', 'cuisine', 'admin'], { toujours: true }), async (req, res) => {
+app.get('/api/auth/moi', exiger(['restaurant', 'cuisine', 'personnel', 'admin'], { toujours: true }), async (req, res) => {
   const a = req.auth;
   const base = { role: a.role, restaurant_id: a.restaurant_id || null };
   if (a.role === 'restaurant') {
@@ -220,6 +278,12 @@ app.get('/api/auth/moi', exiger(['restaurant', 'cuisine', 'admin'], { toujours: 
     if (error) return echec(res, 'moi', error);
     if (!data) return res.status(401).json({ error: 'Session invalide.' });
     return res.json({ ...base, restaurant: nettoyerResto(data) });
+  }
+  if (a.role === 'personnel') {
+    const { data, error } = await supabase.from('restaurants').select('id, nom, code_unique').eq('id', a.restaurant_id).maybeSingle();
+    if (error) return echec(res, 'moi', error);
+    if (!data) return res.status(401).json({ error: 'Session invalide.' });
+    return res.json({ ...base, poste: a.poste, nom: a.nom, restaurant: data });
   }
   res.json(base);
 });
@@ -353,7 +417,143 @@ app.put('/api/restaurants/:id/code-cuisine', validerUuid('id'), exiger(['restaur
   if (!data) return res.status(404).json({ error: 'Restaurant introuvable.' });
   res.json(nettoyerResto(data));
 });
+/* ───────────────────────── Équipe (personnel) ───────────────────────── */
+const POSTES = ['manager', 'caissier', 'cuisinier', 'stock'];
+const IDENTIFIANT = /^[a-z0-9._-]{3,30}$/;
+const COLONNES_PERSONNEL = 'id, nom, identifiant, poste, actif, derniere_connexion, created_at';
+const mdpValide = (m) => typeof m === 'string' && m.length >= 6 && m.length <= 64;
 
+// Connexion d'un membre du personnel : code du restaurant + identifiant + mot de passe personnel.
+app.post('/api/personnel/connexion',
+  limiter('perso-ip', 200, 900000, parIp),
+  limiter('perso-id', 10, 900000, (req) => `${texte(req.body && req.body.code_unique, 30).toUpperCase()}:${texte(req.body && req.body.identifiant, 40).toLowerCase()}`),
+  async (req, res) => {
+    const b = req.body || {};
+    const code = texte(b.code_unique, 30).toUpperCase();
+    const identifiant = texte(b.identifiant, 40).toLowerCase();
+    const mdp = typeof b.mot_de_passe === 'string' ? b.mot_de_passe.slice(0, 128) : '';
+    const { data: resto, error: e1 } = await supabase.from('restaurants').select('id, nom, code_unique, statut').eq('code_unique', code).maybeSingle();
+    if (e1) return echec(res, 'personnel/restaurant', e1);
+    let membre = null;
+    if (resto) {
+      const { data, error } = await supabase.from('personnel').select('id, nom, poste, actif, mot_de_passe').eq('restaurant_id', resto.id).eq('identifiant', identifiant).maybeSingle();
+      if (error) return echec(res, 'personnel/lecture', error);
+      membre = data;
+    }
+    let valide = false;
+    try { valide = await bcrypt.compare(mdp, membre ? membre.mot_de_passe : HASH_FACTICE); } catch { valide = false; }
+    if (!resto || !membre || !valide) return res.status(400).json({ error: 'Code restaurant, identifiant ou mot de passe incorrect.' });
+    if (!membre.actif) return res.status(403).json({ error: 'Ce compte est désactivé. Contactez votre responsable.' });
+    if (STATUTS_BLOQUES.includes(resto.statut)) return res.status(403).json({ error: "Ce restaurant n'est pas encore actif." });
+    const { error: eC } = await supabase.from('personnel').update({ derniere_connexion: new Date().toISOString() }).eq('id', membre.id);
+    if (eC) console.error('[PERSONNEL] dernière connexion non enregistrée :', eC.message);
+    const token = ouvrirSession(res, { id: membre.id, role: 'personnel', restaurant_id: resto.id, nom: membre.nom, poste: membre.poste });
+    res.json({ token, poste: membre.poste, nom: membre.nom, restaurant: { id: resto.id, nom: resto.nom, code_unique: resto.code_unique } });
+  }
+);
+
+app.get('/api/personnel/:restaurant_id', validerUuid('restaurant_id'), exiger(['restaurant', 'admin']), async (req, res) => {
+  if (!autorise(req, req.params.restaurant_id)) return res.status(403).json({ error: 'Accès refusé.' });
+  const { data, error } = await supabase.from('personnel').select(COLONNES_PERSONNEL).eq('restaurant_id', req.params.restaurant_id).order('created_at', { ascending: true }).limit(100);
+  if (error) return echec(res, 'liste personnel', error);
+  res.json(data);
+});
+
+app.post('/api/personnel/:restaurant_id', validerUuid('restaurant_id'), exiger(['restaurant', 'admin']), async (req, res) => {
+  if (!autorise(req, req.params.restaurant_id)) return res.status(403).json({ error: 'Accès refusé.' });
+  const b = req.body || {};
+  const nom = texte(b.nom, 80);
+  if (nom.length < 2) return res.status(400).json({ error: 'Saisissez le nom de la personne.' });
+  const identifiant = texte(b.identifiant, 40).toLowerCase();
+  if (!IDENTIFIANT.test(identifiant)) return res.status(400).json({ error: "L'identifiant doit contenir de 3 à 30 lettres minuscules, chiffres, points ou tirets." });
+  if (!POSTES.includes(b.poste)) return res.status(400).json({ error: 'Choisissez un poste.' });
+  if (!mdpValide(b.mot_de_passe)) return res.status(400).json({ error: 'Le mot de passe doit contenir de 6 à 64 caractères.' });
+  const { count, error: eN } = await supabase.from('personnel').select('id', { count: 'exact', head: true }).eq('restaurant_id', req.params.restaurant_id);
+  if (eN) return echec(res, 'personnel/compte', eN);
+  if ((count || 0) >= 50) return res.status(400).json({ error: 'Limite de 50 comptes atteinte.' });
+  const hash = await bcrypt.hash(b.mot_de_passe, 10);
+  const { data, error } = await supabase.from('personnel')
+    .insert([{ restaurant_id: req.params.restaurant_id, nom, identifiant, poste: b.poste, mot_de_passe: hash }])
+    .select(COLONNES_PERSONNEL).single();
+  if (error) {
+    if (error.code === '23505') return res.status(409).json({ error: 'Cet identifiant est déjà utilisé.' });
+    return echec(res, 'créer personnel', error);
+  }
+  res.json(data);
+});
+
+app.put('/api/personnel/:restaurant_id/:id', validerUuid('restaurant_id', 'id'), exiger(['restaurant', 'admin']), async (req, res) => {
+  if (!autorise(req, req.params.restaurant_id)) return res.status(403).json({ error: 'Accès refusé.' });
+  const b = req.body || {};
+  const maj = {};
+  if (b.nom !== undefined) { const nom = texte(b.nom, 80); if (nom.length < 2) return res.status(400).json({ error: 'Saisissez le nom de la personne.' }); maj.nom = nom; }
+  if (b.poste !== undefined) { if (!POSTES.includes(b.poste)) return res.status(400).json({ error: 'Choisissez un poste.' }); maj.poste = b.poste; }
+  if (b.actif !== undefined) { if (typeof b.actif !== 'boolean') return res.status(400).json({ error: 'Requête invalide.' }); maj.actif = b.actif; }
+  if (b.mot_de_passe !== undefined) { if (!mdpValide(b.mot_de_passe)) return res.status(400).json({ error: 'Le mot de passe doit contenir de 6 à 64 caractères.' }); maj.mot_de_passe = await bcrypt.hash(b.mot_de_passe, 10); }
+  if (!Object.keys(maj).length) return res.status(400).json({ error: 'Rien à modifier.' });
+  const { data, error } = await supabase.from('personnel').update(maj).eq('id', req.params.id).eq('restaurant_id', req.params.restaurant_id).select(COLONNES_PERSONNEL).maybeSingle();
+  if (error) return echec(res, 'maj personnel', error);
+  if (!data) return res.status(404).json({ error: 'Compte introuvable.' });
+  oublierPersonnel(req.params.id);
+  res.json(data);
+});
+
+app.delete('/api/personnel/:restaurant_id/:id', validerUuid('restaurant_id', 'id'), exiger(['restaurant', 'admin']), async (req, res) => {
+  if (!autorise(req, req.params.restaurant_id)) return res.status(403).json({ error: 'Accès refusé.' });
+  const { error } = await supabase.from('personnel').delete().eq('id', req.params.id).eq('restaurant_id', req.params.restaurant_id);
+  if (error) return echec(res, 'supprimer personnel', error);
+  oublierPersonnel(req.params.id);
+  res.json({ ok: true });
+});
+
+/* ───────────────────────── Candidatures (recrutement) ───────────────────────── */
+const STATUTS_CANDIDATURE = ['nouvelle', 'a_contacter', 'retenue', 'refusee'];
+const COLONNES_CANDIDATURE = 'id, nom, telephone, poste, message, statut, created_at';
+
+// Un candidat postule sans compte, uniquement si le restaurant a activé « Nous recrutons ».
+app.post('/api/restaurants/:id/candidatures', validerUuid('id'), limiter('cand-ip', 5, 3600000, parIp), async (req, res) => {
+  const b = req.body || {};
+  const { data: resto, error: e1 } = await supabase.from('restaurants').select('id, statut, recrutement').eq('id', req.params.id).maybeSingle();
+  if (e1) return echec(res, 'candidature/restaurant', e1);
+  if (!resto) return res.status(404).json({ error: 'Restaurant introuvable.' });
+  if (STATUTS_BLOQUES.includes(resto.statut) || !(resto.recrutement && resto.recrutement.actif)) return res.status(403).json({ error: 'Ce restaurant ne recrute pas actuellement.' });
+  const nom = texte(b.nom, 80);
+  if (nom.length < 2) return res.status(400).json({ error: 'Saisissez votre nom.' });
+  const telephone = chiffresTel(b.telephone);
+  if (!telephone) return res.status(400).json({ error: 'Saisissez un numéro de téléphone valide.' });
+  const message = texte(b.message, 800) || null;
+  const poste = texte(resto.recrutement.poste, 80) || null;
+  const { count, error: eN } = await supabase.from('candidatures').select('id', { count: 'exact', head: true }).eq('restaurant_id', resto.id);
+  if (eN) return echec(res, 'candidature/compte', eN);
+  if ((count || 0) >= 300) return res.status(400).json({ error: 'Ce restaurant ne peut plus recevoir de candidatures pour le moment.' });
+  const { error } = await supabase.from('candidatures').insert([{ restaurant_id: resto.id, nom, telephone, poste, message }]);
+  if (error) return echec(res, 'candidature', error);
+  res.json({ ok: true });
+});
+
+app.get('/api/candidatures/:restaurant_id', validerUuid('restaurant_id'), exiger(['restaurant', 'admin']), async (req, res) => {
+  if (!autorise(req, req.params.restaurant_id)) return res.status(403).json({ error: 'Accès refusé.' });
+  const { data, error } = await supabase.from('candidatures').select(COLONNES_CANDIDATURE).eq('restaurant_id', req.params.restaurant_id).order('created_at', { ascending: false }).limit(300);
+  if (error) return echec(res, 'liste candidatures', error);
+  res.json(data);
+});
+
+app.put('/api/candidatures/:restaurant_id/:id', validerUuid('restaurant_id', 'id'), exiger(['restaurant', 'admin']), async (req, res) => {
+  if (!autorise(req, req.params.restaurant_id)) return res.status(403).json({ error: 'Accès refusé.' });
+  const statut = req.body && req.body.statut;
+  if (!STATUTS_CANDIDATURE.includes(statut)) return res.status(400).json({ error: 'Statut invalide.' });
+  const { data, error } = await supabase.from('candidatures').update({ statut }).eq('id', req.params.id).eq('restaurant_id', req.params.restaurant_id).select(COLONNES_CANDIDATURE).maybeSingle();
+  if (error) return echec(res, 'maj candidature', error);
+  if (!data) return res.status(404).json({ error: 'Candidature introuvable.' });
+  res.json(data);
+});
+
+app.delete('/api/candidatures/:restaurant_id/:id', validerUuid('restaurant_id', 'id'), exiger(['restaurant', 'admin']), async (req, res) => {
+  if (!autorise(req, req.params.restaurant_id)) return res.status(403).json({ error: 'Accès refusé.' });
+  const { error } = await supabase.from('candidatures').delete().eq('id', req.params.id).eq('restaurant_id', req.params.restaurant_id);
+  if (error) return echec(res, 'supprimer candidature', error);
+  res.json({ ok: true });
+});
 /* ───────────────────────── Administration ───────────────────────── */
 app.post('/api/admin/connexion', limiter('admin-ip', 100, 900000, parIp), limiter('admin-email', 5, 900000, parEmail), async (req, res) => {
   const b = req.body || {};
